@@ -296,6 +296,9 @@ fork(void)
   }
   np->sz = p->sz;
 
+	// copy masked traced syscall ID
+	np->mask = p->mask;
+
   // copy saved user registers.
   *(np->trapframe) = *(p->trapframe);
 
