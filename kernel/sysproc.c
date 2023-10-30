@@ -30,7 +30,7 @@ sys_fork(void)
 uint64
 sys_wait(void)
 {
-  uint64 p;
+	uint64 p;
   argaddr(0, &p);
   return wait(p);
 }
@@ -93,4 +93,25 @@ sys_uptime(void)
   xticks = ticks;
   release(&tickslock);
   return xticks;
+}
+
+uint64
+sys_sigalarm(void)
+{
+	struct proc *p = myproc();
+
+	argint(0, &(p->alarmtick));
+	p->tickpassed = 0;
+	argaddr(1, &(p->alarmfn));
+	return 0;
+}
+
+uint64
+sys_sigreturn(void)
+{
+	struct proc *p = myproc();
+
+	memmove(p->trapframe, p->trapframe_backup, sizeof(struct trapframe));
+	p->tickpassed = 0; // Prevent re-entrant alarm handler
+	return p->trapframe->a0;
 }
