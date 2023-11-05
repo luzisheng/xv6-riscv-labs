@@ -15,6 +15,10 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[]; // trampoline.S
 
+extern int refnum[]; // pgtable num refer to the pa
+extern struct spinlock refnumlock;
+extern int cowhandler(pagetable_t, uint64);
+
 // Make a direct-map page table for the kernel.
 pagetable_t
 kvmmake(void)
@@ -154,7 +158,7 @@ mappages(pagetable_t pagetable, uint64 va, uint64 size, uint64 pa, int perm)
     if((pte = walk(pagetable, a, 1)) == 0)
       return -1;
     if(*pte & PTE_V)
-      panic("mappages: remap");
+			panic("mappages: remap");
     *pte = PA2PTE(pa) | perm | PTE_V;
     if(a == last)
       break;
@@ -183,8 +187,10 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
       panic("uvmunmap: not mapped");
     if(PTE_FLAGS(*pte) == PTE_V)
       panic("uvmunmap: not a leaf");
+
+		uint64 pa = PTE2PA(*pte);
+
     if(do_free){
-      uint64 pa = PTE2PA(*pte);
       kfree((void*)pa);
     }
     *pte = 0;
@@ -296,40 +302,37 @@ uvmfree(pagetable_t pagetable, uint64 sz)
   freewalk(pagetable);
 }
 
-// Given a parent process's page table, copy
-// its memory into a child's page table.
-// Copies both the page table and the
-// physical memory.
-// returns 0 on success, -1 on failure.
-// frees any allocated pages on failure.
+// Given a parent process's page table, map
+// its physical pages into the child.
+// Clear PTE_W in both child and parent PTEs.
+// Returns 0 on success, -1 on failure.
+// Clear any mapped pages on failure.
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
-  pte_t *pte;
-  uint64 pa, i;
-  uint flags;
-  char *mem;
-
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+  for(uint64 i = 0; i < sz; i += PGSIZE){
+		pte_t *pte = walk(old, i, 0);
+    if(pte == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+		if(*pte & PTE_W){
+			*pte &= ~PTE_W;
+			*pte |= PTE_C;
+		}
+
+    uint64 pa = PTE2PA(*pte);
+    uint flags = PTE_FLAGS(*pte);
+    if(mappages(new, i, PGSIZE, pa, flags) != 0){
+      uvmunmap(new, 0, i/PGSIZE, 0);
+      return -1;
     }
+
+		acquire(&refnumlock);
+		refnum[pa / PGSIZE] += 1;
+		release(&refnumlock);
   }
   return 0;
-
- err:
-  uvmunmap(new, 0, i / PGSIZE, 1);
-  return -1;
 }
 
 // mark a PTE invalid for user access.
@@ -347,11 +350,15 @@ uvmclear(pagetable_t pagetable, uint64 va)
 
 // Copy from kernel to user.
 // Copy len bytes from src to virtual address dstva in a given page table.
+// Support COW
 // Return 0 on success, -1 on error.
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
   uint64 n, va0, pa0;
+
+	// deal with COW
+	cowhandler(pagetable, dstva);
 
   while(len > 0){
     va0 = PGROUNDDOWN(dstva);

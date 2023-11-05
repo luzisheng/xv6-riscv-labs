@@ -10,11 +10,14 @@ struct spinlock tickslock;
 uint ticks;
 
 extern char trampoline[], uservec[], userret[];
+extern int refnum[];
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
 
 extern int devintr();
+ 
+int cowhandler(pagetable_t, uint64);
 
 void
 trapinit(void)
@@ -65,7 +68,10 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+  } else if(r_scause() == 15 && cowhandler(p->pagetable, r_stval()) == 0){
+		// store/AMO page fault and successfully managed cow page
+		// ok
+	} else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
@@ -219,3 +225,38 @@ devintr()
   }
 }
 
+// page fault handler, return 0 if manage cow pages successfully.
+int cowhandler(pagetable_t pagetable, uint64 va)
+{
+	pte_t *pte = walk(pagetable, va, 0);
+
+	// not a COW page fault where PTE_C == 1 & PTE_W == 0
+	if((*pte & PTE_C) == 0 || (~(*pte) & PTE_W) == 0)
+		return -1;
+
+	uint64 pa = PTE2PA(*pte);
+
+	if(refnum[pa / PGSIZE] == 1){
+		// mark this COW page as exclusive
+		*pte |= PTE_W;
+		*pte &= ~PTE_C;
+		return 0;
+	} else if(refnum[pa / PGSIZE] > 1){
+		// allocate a new page for this process
+		char *mem = kalloc();
+
+		if(mem == 0)
+			return -1;
+
+		memmove(mem, (char*)pa, PGSIZE);
+
+		kfree((void*)pa);
+
+		uint flags = PTE_FLAGS(*pte);
+		*pte = (PA2PTE(mem) | flags | PTE_W);
+		*pte &= ~PTE_C;
+
+		return 0;
+	}
+	return -1;
+}
