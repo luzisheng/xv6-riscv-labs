@@ -189,6 +189,7 @@ UPROGS=\
 	$U/_wc\
 	$U/_zombie\
 	$U/_kalloctest\
+	$U/_bcachetest\
 
 
 
