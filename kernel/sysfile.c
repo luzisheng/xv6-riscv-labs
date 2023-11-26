@@ -16,6 +16,8 @@
 #include "file.h"
 #include "fcntl.h"
 
+#define MAXDEPTH 10
+
 // Fetch the nth word-sized system call argument as a file descriptor
 // and return both the descriptor and the corresponding struct file.
 static int
@@ -119,6 +121,65 @@ sys_fstat(void)
   return filestat(f, st);
 }
 
+static struct inode*
+create(char *path, short type, short major, short minor)
+{
+  struct inode *ip, *dp;
+  char name[DIRSIZ];
+
+  if((dp = nameiparent(path, name)) == 0)
+    return 0;
+
+  ilock(dp);
+
+  if((ip = dirlookup(dp, name, 0)) != 0){
+    iunlockput(dp);
+    ilock(ip);
+    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
+      return ip;
+    iunlockput(ip);
+    return 0;
+  }
+
+  if((ip = ialloc(dp->dev, type)) == 0){
+    iunlockput(dp);
+    return 0;
+  }
+
+  ilock(ip);
+  ip->major = major;
+  ip->minor = minor;
+  ip->nlink = 1;
+  iupdate(ip);
+
+  if(type == T_DIR){  // Create . and .. entries.
+    // No ip->nlink++ for ".": avoid cyclic ref count.
+    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
+      goto fail;
+  }
+
+  if(dirlink(dp, name, ip->inum) < 0)
+    goto fail;
+
+  if(type == T_DIR){
+    // now that success is guaranteed:
+    dp->nlink++;  // for ".."
+    iupdate(dp);
+  }
+
+  iunlockput(dp);
+
+  return ip;
+
+ fail:
+  // something went wrong. de-allocate ip.
+  ip->nlink = 0;
+  iupdate(ip);
+  iunlockput(ip);
+  iunlockput(dp);
+  return 0;
+}
+
 // Create the path new as a link to the same inode as old.
 uint64
 sys_link(void)
@@ -167,6 +228,33 @@ bad:
   iunlockput(ip);
   end_op();
   return -1;
+}
+
+uint64
+sys_symlink(void)
+{
+	char target[MAXPATH], path[MAXPATH];
+	struct inode *ip;
+
+	if(argstr(0, target, MAXPATH) < 0 || argstr(1, path, MAXPATH) < 0)
+		return -1;
+
+	begin_op();
+
+	if((ip = create(path, T_SYMLINK, 0, 0)) == 0){
+		end_op();
+		return -1;
+	}
+
+	if(writei(ip, 0, (uint64)target, 0, MAXPATH) != MAXPATH){
+		iunlockput(ip);
+		end_op();
+		return -1;
+	}
+	iunlockput(ip);
+
+	end_op();
+	return 0;
 }
 
 // Is the directory dp empty except for "." and ".." ?
@@ -242,110 +330,54 @@ bad:
   return -1;
 }
 
-static struct inode*
-create(char *path, short type, short major, short minor)
+static uint64 
+open_helper(char *path, int omode, int depth)
 {
-  struct inode *ip, *dp;
-  char name[DIRSIZ];
+	char newpath[MAXPATH];
+	int fd;
+	struct file *f;
+	struct inode *ip;
 
-  if((dp = nameiparent(path, name)) == 0)
-    return 0;
-
-  ilock(dp);
-
-  if((ip = dirlookup(dp, name, 0)) != 0){
-    iunlockput(dp);
-    ilock(ip);
-    if(type == T_FILE && (ip->type == T_FILE || ip->type == T_DEVICE))
-      return ip;
-    iunlockput(ip);
-    return 0;
-  }
-
-  if((ip = ialloc(dp->dev, type)) == 0){
-    iunlockput(dp);
-    return 0;
-  }
-
-  ilock(ip);
-  ip->major = major;
-  ip->minor = minor;
-  ip->nlink = 1;
-  iupdate(ip);
-
-  if(type == T_DIR){  // Create . and .. entries.
-    // No ip->nlink++ for ".": avoid cyclic ref count.
-    if(dirlink(ip, ".", ip->inum) < 0 || dirlink(ip, "..", dp->inum) < 0)
-      goto fail;
-  }
-
-  if(dirlink(dp, name, ip->inum) < 0)
-    goto fail;
-
-  if(type == T_DIR){
-    // now that success is guaranteed:
-    dp->nlink++;  // for ".."
-    iupdate(dp);
-  }
-
-  iunlockput(dp);
-
-  return ip;
-
- fail:
-  // something went wrong. de-allocate ip.
-  ip->nlink = 0;
-  iupdate(ip);
-  iunlockput(ip);
-  iunlockput(dp);
-  return 0;
-}
-
-uint64
-sys_open(void)
-{
-  char path[MAXPATH];
-  int fd, omode;
-  struct file *f;
-  struct inode *ip;
-  int n;
-
-  argint(1, &omode);
-  if((n = argstr(0, path, MAXPATH)) < 0)
-    return -1;
-
-  begin_op();
+	// the symlinks form a cycle
+	if(depth > MAXDEPTH)
+		return -1;
 
   if(omode & O_CREATE){
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
-      end_op();
       return -1;
     }
   } else {
     if((ip = namei(path)) == 0){
-      end_op();
       return -1;
     }
     ilock(ip);
     if(ip->type == T_DIR && omode != O_RDONLY){
       iunlockput(ip);
-      end_op();
       return -1;
     }
   }
 
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
-    end_op();
     return -1;
+  }
+
+  // symlink tail recursion
+  if(ip->type == T_SYMLINK && !(omode & O_NOFOLLOW)){
+    if(readi(ip, 0, (uint64)newpath, 0, MAXPATH) != MAXPATH){
+      iunlockput(ip);
+      return -1;
+    }
+
+    iunlockput(ip);
+    return open_helper(newpath, omode, depth+1);
   }
 
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
     iunlockput(ip);
-    end_op();
     return -1;
   }
 
@@ -365,6 +397,22 @@ sys_open(void)
   }
 
   iunlock(ip);
+
+	return fd;
+}
+
+uint64
+sys_open(void)
+{
+  char path[MAXPATH];
+  int omode, fd;
+
+  if(argstr(0, path, MAXPATH) < 0)
+    return -1;
+	argint(1, &omode);
+
+  begin_op();
+	fd = open_helper(path, omode, 1);
   end_op();
 
   return fd;
